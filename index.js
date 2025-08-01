@@ -1,10 +1,14 @@
 require("dotenv").config();
 const express = require("express");
+const app = express();
 const { Client, LocalAuth } = require("whatsapp-web.js");
+const puppeteer = require("puppeteer");
 const qrcode = require("qrcode-terminal");
 const cors = require("cors");
 const axios = require("axios");
 const Joi = require("joi");
+
+let latestQR = null;
 
 // ——— Configuration ———
 const PORT = process.env.PORT || 3000;
@@ -23,7 +27,28 @@ const client = new Client({
 // Store group chat instance for notifications
 let groupChatInstance = null;
 
-client.on("qr", (qr) => qrcode.generate(qr, { small: true }));
+const { toDataURL } = require("qrcode"); // install qrcode (bukan qrcode-terminal)
+
+client.on("qr", async (qr) => {
+  latestQR = await toDataURL(qr); // simpan base64 QR
+  console.log("QR code received. Scan via browser at /qr");
+});
+
+app.get("/qr", (req, res) => {
+  if (!latestQR) return res.send("QR belum tersedia");
+  res.send(`
+    <html>
+      <body style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;">
+        <h2>Scan QR WhatsApp</h2>
+        <img src="${latestQR}" style="width:300px;height:300px;" />
+      </body>
+    </html>
+  `);
+});
+
+app.get("/health", (req, res) => {
+  res.send("OK");
+});
 
 client.on("ready", async () => {
   console.log("WhatsApp client is ready");
@@ -126,7 +151,6 @@ client.on("message", async (msg) => {
 client.initialize();
 
 // ——— Express App & Routes ———
-const app = express();
 app.use(cors());
 app.use(express.json());
 
