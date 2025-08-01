@@ -10,7 +10,7 @@ COPY package*.json ./
 # Install dependencies
 RUN npm install
 
-# Salin seluruh project ke dalam container
+# Salin seluruh project ke dalam containerr
 COPY . .
 
 # Jalankan aplikasi saat container start
