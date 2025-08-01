@@ -169,9 +169,19 @@ const msgSchema = Joi.object({
 }).xor("number", "groupTitle");
 
 app.post("/send-message", async (req, res) => {
+  // Validate payload
   const { error, value } = msgSchema.validate(req.body);
   if (error) {
+    console.warn("❌ Validation error:", error.message);
     return res.status(400).json({ success: false, error: error.message });
+  }
+
+  // Check if WhatsApp client is ready
+  if (!client.info || !client.info.wid) {
+    console.warn("⚠️ WhatsApp client not ready");
+    return res
+      .status(503)
+      .json({ success: false, error: "WhatsApp client not ready" });
   }
 
   const { number, groupTitle, message } = value;
@@ -179,32 +189,41 @@ app.post("/send-message", async (req, res) => {
   try {
     let chatId;
 
+    // Determine recipient
     if (number) {
       const normalized = number.replace(/\D/g, "");
       chatId = `${normalized}@c.us`;
     } else {
       if (groupTitle === GROUP_NAME && cachedGroupId) {
-        chatId = cachedGroupId; // ⬅️ gunakan cache
+        chatId = cachedGroupId;
       } else {
-        const chats = await client.getChats(); // ⬅️ fallback
-        const chat = chats.find((c) => c.name === groupTitle);
-        if (!chat) {
+        const chats = await client.getChats();
+        const group = chats.find((c) => c.name === groupTitle);
+        if (!group) {
+          console.warn(`❌ Group "${groupTitle}" not found`);
           return res
             .status(404)
             .json({ success: false, error: "Group not found" });
         }
-        chatId = chat.id._serialized;
+        chatId = group.id._serialized;
       }
     }
 
-    client
-      .sendMessage(chatId, message)
-      .then(() => console.log(`✅ Message sent to ${chatId}`))
-      .catch((err) => console.error("❌ Failed to send message:", err.message));
+    // Respond immediately to avoid blocking client
+    res.json({
+      success: true,
+      to: chatId,
+      note: "Sending message in background",
+    });
 
-    res.json({ success: true, to: chatId, note: "Sent in background" });
+    // Background send
+    await client.sendMessage(chatId, message);
+    console.log(`✅ Message sent to ${chatId}`);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error("❌ Error in send-message:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: err.message });
+    }
   }
 });
 
