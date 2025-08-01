@@ -1,6 +1,6 @@
 FROM node:20-slim
 
-# Install dependencies for puppeteer & chromium
+# Install dependencies for puppeteer & chromium (fix libgobject)
 RUN apt-get update && apt-get install -y \
     wget \
     ca-certificates \
@@ -24,27 +24,18 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     libxss1 \
     libgconf-2-4 \
-    libgobject-2.0-0 \
+    libglib2.0-0 \
     --no-install-recommends && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy and install dependencies
 COPY package*.json ./
 RUN npm install
 
-# Copy rest of the app
 COPY . .
 
-# Set environment variables for Puppeteer
-ENV PUPPETEER_SKIP_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome
-
-# Expose port
 EXPOSE 3000
 
-# Run the app
 CMD [ "node", "index.js" ]
