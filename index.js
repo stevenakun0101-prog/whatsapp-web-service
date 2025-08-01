@@ -26,6 +26,7 @@ const client = new Client({
 
 // Store group chat instance for notifications
 let groupChatInstance = null;
+let cachedGroupId = null;
 
 const { toDataURL } = require("qrcode"); // install qrcode (bukan qrcode-terminal)
 
@@ -54,9 +55,13 @@ client.on("ready", async () => {
   console.log("WhatsApp client is ready");
   try {
     const chats = await client.getChats();
-    groupChatInstance = chats.find((c) => c.name === GROUP_NAME) || null;
-    if (!groupChatInstance) {
-      console.warn(`Group "${GROUP_NAME}" not found on ready.`);
+    const group = chats.find((c) => c.name === GROUP_NAME);
+    if (group) {
+      groupChatInstance = group;
+      cachedGroupId = group.id._serialized; // ⬅️ cache id di sini
+      console.log(`Group "${GROUP_NAME}" found`);
+    } else {
+      console.warn(`Group "${GROUP_NAME}" not found`);
     }
   } catch (e) {
     console.error("Error fetching chats on ready:", e.message);
@@ -170,6 +175,7 @@ app.post("/send-message", async (req, res) => {
   }
 
   const { number, groupTitle, message } = value;
+
   try {
     let chatId;
 
@@ -177,18 +183,26 @@ app.post("/send-message", async (req, res) => {
       const normalized = number.replace(/\D/g, "");
       chatId = `${normalized}@c.us`;
     } else {
-      const chats = await client.getChats();
-      const chat = chats.find((c) => c.name === groupTitle);
-      if (!chat) {
-        return res
-          .status(404)
-          .json({ success: false, error: "Group not found" });
+      if (groupTitle === GROUP_NAME && cachedGroupId) {
+        chatId = cachedGroupId; // ⬅️ gunakan cache
+      } else {
+        const chats = await client.getChats(); // ⬅️ fallback
+        const chat = chats.find((c) => c.name === groupTitle);
+        if (!chat) {
+          return res
+            .status(404)
+            .json({ success: false, error: "Group not found" });
+        }
+        chatId = chat.id._serialized;
       }
-      chatId = chat.id._serialized;
     }
 
-    await client.sendMessage(chatId, message);
-    res.json({ success: true, to: chatId });
+    client
+      .sendMessage(chatId, message)
+      .then(() => console.log(`✅ Message sent to ${chatId}`))
+      .catch((err) => console.error("❌ Failed to send message:", err.message));
+
+    res.json({ success: true, to: chatId, note: "Sent in background" });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
