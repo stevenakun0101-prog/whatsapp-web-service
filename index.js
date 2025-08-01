@@ -1,14 +1,14 @@
 require("dotenv").config();
 const express = require("express");
-const app = express();
 const { Client, LocalAuth } = require("whatsapp-web.js");
-const puppeteer = require("puppeteer");
-const qrcode = require("qrcode-terminal");
+const { toDataURL } = require("qrcode");
+const Joi = require("joi");
 const cors = require("cors");
 const axios = require("axios");
-const Joi = require("joi");
 
-let latestQR = null;
+const app = express();
+app.use(cors());
+app.use(express.json());
 
 // ——— Configuration ———
 const PORT = process.env.PORT || 3000;
@@ -17,6 +17,11 @@ const API_ENDPOINT =
   process.env.API_ENDPOINT || "http://localhost:8000/api/orders/mark-as-done";
 
 // ——— WhatsApp Client Setup ———
+let latestQR = null;
+let clientReady = false;
+let groupChatInstance = null;
+let cachedGroupId = null;
+
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
@@ -24,17 +29,49 @@ const client = new Client({
   },
 });
 
-// Store group chat instance for notifications
-let groupChatInstance = null;
-let cachedGroupId = null;
-
-const { toDataURL } = require("qrcode"); // install qrcode (bukan qrcode-terminal)
-
 client.on("qr", async (qr) => {
-  latestQR = await toDataURL(qr); // simpan base64 QR
-  console.log("QR code received. Scan via browser at /qr");
+  latestQR = await toDataURL(qr);
+  console.log("[WA-BOT] QR code received. Scan via /qr");
 });
 
+client.on("ready", async () => {
+  clientReady = true;
+  console.log("[WA-BOT] WhatsApp client is ready");
+
+  try {
+    const chats = await client.getChats();
+    const group = chats.find((c) => c.name === GROUP_NAME);
+    if (group) {
+      groupChatInstance = group;
+      cachedGroupId = group.id._serialized;
+      console.log(`[WA-BOT] Group "${GROUP_NAME}" found and cached`);
+    } else {
+      console.warn(`[WA-BOT] Group "${GROUP_NAME}" not found`);
+    }
+  } catch (e) {
+    console.error("[WA-BOT] Error fetching group chats:", e.message);
+  }
+});
+
+client.on("auth_failure", (msg) => {
+  console.error("[WA-BOT] AUTH FAILURE:", msg);
+  clientReady = false;
+  notifyGroup("⚠️ Sesi WhatsApp berakhir. Silakan scan ulang QR Code.");
+  client.destroy();
+  client.initialize();
+});
+
+client.on("disconnected", (reason) => {
+  console.warn("[WA-BOT] Disconnected:", reason);
+  clientReady = false;
+  notifyGroup("⚠️ WhatsApp terputus. Mencoba menyambung kembali...");
+  setTimeout(() => {
+    client.destroy();
+    client.initialize();
+  }, 5000);
+});
+
+// ——— QR Code Endpoint ———
 app.get("/qr", (req, res) => {
   if (!latestQR) return res.send("QR belum tersedia");
   res.send(`
@@ -47,86 +84,31 @@ app.get("/qr", (req, res) => {
   `);
 });
 
-app.get("/health", (req, res) => {
-  res.send("OK");
-});
+// ——— Health Check ———
+app.get("/health", (req, res) => res.send("OK"));
 
-client.on("ready", async () => {
-  console.log("WhatsApp client is ready");
-  try {
-    const chats = await client.getChats();
-    const group = chats.find((c) => c.name === GROUP_NAME);
-    if (group) {
-      groupChatInstance = group;
-      cachedGroupId = group.id._serialized; // ⬅️ cache id di sini
-      console.log(`Group "${GROUP_NAME}" found`);
-    } else {
-      console.warn(`Group "${GROUP_NAME}" not found`);
-    }
-  } catch (e) {
-    console.error("Error fetching chats on ready:", e.message);
-  }
-});
-
-// ——— Keep-alive (heartbeat) ———
-// Kirim ping berkala untuk menjaga koneksi tidak idle
-setInterval(() => {
-  client.getState().catch(() => {
-    // ignore errors
+// ——— WhatsApp Status Check ———
+app.get("/status", (req, res) => {
+  res.json({
+    ready: clientReady,
+    groupCached: Boolean(cachedGroupId),
+    info: client.info || null,
   });
-}, 1000 * 60 * 5); // setiap 5 menit
-
-// Handle authentication failure (session expired)
-client.on("auth_failure", async (msg) => {
-  console.error("AUTH FAILURE:", msg);
-  if (groupChatInstance) {
-    try {
-      await groupChatInstance.sendMessage(
-        "⚠️ Sesi WhatsApp telah berakhir. Silakan scan ulang QR Code."
-      );
-    } catch (e) {
-      console.error("Failed to notify group on auth failure:", e.message);
-    }
-  }
-  // Re-initialize to prompt new QR
-  client.destroy();
-  client.initialize();
 });
 
-// Handle disconnection
-client.on("disconnected", async (reason) => {
-  console.warn("WhatsApp disconnected:", reason);
-  if (groupChatInstance) {
-    try {
-      await groupChatInstance.sendMessage(
-        "⚠️ WhatsApp terputus. Mencoba menyambung kembali..."
-      );
-    } catch (e) {
-      console.error("Failed to notify group on disconnected:", e.message);
-    }
-  }
-  // Attempt reconnection after short delay
-  setTimeout(() => {
-    client.destroy();
-    client.initialize();
-  }, 5000);
-});
-
-// ——— Event-driven Incoming Message Handler ———
+// ——— Incoming Message Handler ———
 client.on("message", async (msg) => {
   try {
     if (msg.fromMe) return;
 
-    // Get the chat object
     const chat = await msg.getChat();
     if (!chat.isGroup || chat.name !== GROUP_NAME) return;
 
-    // Match pattern d/123 or D/123
     const match = msg.body.match(/[dD]\/(\d+)/);
     if (!match) return;
 
     const orderId = match[1];
-    console.log(`→ Found orderId: ${orderId}`);
+    console.log(`→ Detected order ID: ${orderId}`);
 
     const payload = {
       order_id: orderId,
@@ -136,30 +118,21 @@ client.on("message", async (msg) => {
       timestamp: msg.timestamp,
     };
 
-    // Send to API
     try {
       await axios.post(API_ENDPOINT, payload);
+      await chat.sendMessage(`✅ Order ID ${orderId} telah diproses.`);
     } catch (err) {
-      const errMsg = err.response?.data?.message || err.message;
-      console.error("API Error:", errMsg);
-      return;
+      console.error(
+        "[WA-BOT] API Error:",
+        err.response?.data?.message || err.message
+      );
     }
-
-    // Send confirmation back to group
-    await chat.sendMessage(`Order dengan ID ${orderId} telah sukses.`);
   } catch (err) {
-    console.error("Error processing incoming message:", err.message);
+    console.error("[WA-BOT] Message handler error:", err.message);
   }
 });
 
-// Initialize WhatsApp client
-client.initialize();
-
-// ——— Express App & Routes ———
-app.use(cors());
-app.use(express.json());
-
-// Validation schema for send-message
+// ——— Send Message API ———
 const msgSchema = Joi.object({
   number: Joi.string()
     .pattern(/^\+?\d+$/)
@@ -169,72 +142,69 @@ const msgSchema = Joi.object({
 }).xor("number", "groupTitle");
 
 app.post("/send-message", async (req, res) => {
-  // Validate payload
   const { error, value } = msgSchema.validate(req.body);
-  if (error) {
-    console.warn("❌ Validation error:", error.message);
+  if (error)
     return res.status(400).json({ success: false, error: error.message });
-  }
 
-  // Check if WhatsApp client is ready
-  if (!client.info || !client.info.wid) {
-    console.warn("⚠️ WhatsApp client not ready");
+  if (!clientReady) {
     return res
       .status(503)
       .json({ success: false, error: "WhatsApp client not ready" });
   }
 
   const { number, groupTitle, message } = value;
+  let chatId;
 
   try {
-    let chatId;
-
-    // Determine recipient
     if (number) {
       const normalized = number.replace(/\D/g, "");
       chatId = `${normalized}@c.us`;
+    } else if (
+      groupTitle?.toLowerCase() === GROUP_NAME.toLowerCase() &&
+      cachedGroupId
+    ) {
+      chatId = cachedGroupId;
     } else {
-      if (groupTitle === GROUP_NAME && cachedGroupId) {
-        chatId = cachedGroupId;
-      } else {
-        const chats = await client.getChats();
-        const group = chats.find((c) => c.name === groupTitle);
-        if (!group) {
-          console.warn(`❌ Group "${groupTitle}" not found`);
-          return res
-            .status(404)
-            .json({ success: false, error: "Group not found" });
-        }
-        chatId = group.id._serialized;
-      }
+      return res
+        .status(404)
+        .json({
+          success: false,
+          error: "Group not cached or unknown groupTitle",
+        });
     }
 
-    // Respond immediately to avoid blocking client
-    res.json({
-      success: true,
-      to: chatId,
-      note: "Sending message in background",
-    });
+    res.json({ success: true, to: chatId, note: "Sending in background" });
 
-    // Background send
     await client.sendMessage(chatId, message);
     console.log(`✅ Message sent to ${chatId}`);
   } catch (err) {
-    console.error("❌ Error in send-message:", err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ success: false, error: err.message });
-    }
+    console.error(`❌ Failed to send message to ${chatId}:`, err.message);
   }
 });
 
-// Start server
+// ——— Helper: Send message to group safely ———
+async function notifyGroup(text) {
+  try {
+    if (groupChatInstance) await groupChatInstance.sendMessage(text);
+  } catch (e) {
+    console.error("[WA-BOT] Failed to notify group:", e.message);
+  }
+}
+
+// ——— Keep-alive ping ———
+setInterval(() => {
+  client.getState().catch(() => {});
+}, 1000 * 60 * 5);
+
+// ——— Start & Shutdown ———
+client.initialize();
+
 const server = app.listen(PORT, () => {
-  console.log(`Server running on http://0.0.0.0:${PORT}`);
+  console.log(`[WA-BOT] Server running on http://0.0.0.0:${PORT}`);
 });
 
-// ——— Graceful Shutdown ———
 async function shutdown() {
-  console.log("Shutting down...");
+  console.log("[WA-BOT] Shutting down...");
   await client.destroy();
   server.close(() => process.exit(0));
 }
