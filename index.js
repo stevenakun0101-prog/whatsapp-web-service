@@ -13,7 +13,12 @@ const API_ENDPOINT =
   process.env.API_ENDPOINT || "http://localhost:8000/api/orders/mark-as-done";
 
 // ——— WhatsApp Client Setup ———
-const client = new Client({ authStrategy: new LocalAuth() });
+const client = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  },
+});
 
 // Store group chat instance for notifications
 let groupChatInstance = null;
